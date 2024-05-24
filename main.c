@@ -36,7 +36,7 @@
 #include "Si5351_config_map.h"
 
 //GET_INFO FW_VER
-#define FW_VER				4
+#define FW_VER				99
 
 #define sbi(p,n) ((p) |= (1UL << (n)))
 #define cbi(p,n) ((p) &= ~(1 << (n)))
@@ -60,7 +60,7 @@ static const char hex_digit[16] = "0123456789ABCDEF";
 static uint32_t *EFUSE_DIE_ID = ((uint32_t *)0xE0055010);
 uint32_t die_id[2];
 
-uint8_t test, block, cmd_errors, glEp0Buffer[64], glEp0Buffer_Rx[64], glEp0Buffer_Tx[64] __attribute__ ((aligned (32))); //4096
+uint8_t test, block, cmd_errors, glEp0Buffer_Rx[LMS_CTRL_PACKET_SIZE], glEp0Buffer_Tx[LMS_CTRL_PACKET_SIZE] __attribute__ ((aligned (32))); //4096
 
 tLMS_Ctrl_Packet *LMS_Ctrl_Packet_Tx = (tLMS_Ctrl_Packet*)glEp0Buffer_Tx;
 tLMS_Ctrl_Packet *LMS_Ctrl_Packet_Rx = (tLMS_Ctrl_Packet*)glEp0Buffer_Rx;
@@ -95,6 +95,395 @@ void Wait_till_SC18B20_busy (void);
 void Reconfigure_SPI_for_LMS (void);
 void Reconfigure_SPI_for_Flash (void);
 void GPIO_configuration (void);
+
+/**	This function checks if all blocks could fit in data field.
+*	If blocks will not fit, function returns TRUE. */
+unsigned char Check_block_count (const tLMS_Ctrl_Packet* in, tLMS_Ctrl_Packet* out, unsigned char block_size)
+{
+	if (in->Header.Data_blocks > (sizeof(out->Data_field)/block_size))
+	{
+		out->Header.Status = STATUS_BLOCKS_ERROR_CMD;
+		return TRUE;
+	}
+	else
+		return FALSE;
+}
+
+// CMD_GET_INFO
+void FillDeviceInfo(tLMS_Ctrl_Packet* pkt)
+{
+	//LSB_bytes
+	pkt->Data_field[0] = FW_VER;
+	pkt->Data_field[1] = DEV_TYPE;
+	pkt->Data_field[2] = LMS_PROTOCOL_VER;
+	pkt->Data_field[3] = HW_VER;
+	pkt->Data_field[4] = EXP_BOARD;
+
+	//BSN - board serial number
+	pkt->Data_field[10] = (die_id[1] >> 24) & 0xFF;
+	pkt->Data_field[11] = (die_id[1] >> 16) & 0xFF;
+	pkt->Data_field[12] = (die_id[1] >>  8) & 0xFF;
+	pkt->Data_field[13] = (die_id[1] >>  0) & 0xFF;
+
+	pkt->Data_field[14] = (die_id[0] >> 24) & 0xFF;
+	pkt->Data_field[15] = (die_id[0] >> 16) & 0xFF;
+	pkt->Data_field[16] = (die_id[0] >>  8) & 0xFF;
+	pkt->Data_field[17] = (die_id[0] >>  0) & 0xFF;
+
+	pkt->Header.Status = STATUS_COMPLETED_CMD;
+}
+
+void HandleResetCommand(const tLMS_Ctrl_Packet* in, tLMS_Ctrl_Packet* out)
+{
+	switch (in->Data_field[0])
+	{
+		case LMS_RST_DEACTIVATE:
+			Modify_BRDSPI16_Reg_bits (FPGA_SPI_REG_LMS1_LMS2_CTRL, LMS1_RESET, LMS1_RESET, 1); //high level
+			break;
+
+		case LMS_RST_ACTIVATE:
+			Modify_BRDSPI16_Reg_bits (FPGA_SPI_REG_LMS1_LMS2_CTRL, LMS1_RESET, LMS1_RESET, 0); //low level
+			break;
+
+		case LMS_RST_PULSE:
+			Modify_BRDSPI16_Reg_bits (FPGA_SPI_REG_LMS1_LMS2_CTRL, LMS1_RESET, LMS1_RESET, 0); //low level
+			Modify_BRDSPI16_Reg_bits (FPGA_SPI_REG_LMS1_LMS2_CTRL, LMS1_RESET, LMS1_RESET, 1); //high level
+			break;
+
+		default:
+			cmd_errors++;
+			break;
+	}
+	out->Header.Status = STATUS_COMPLETED_CMD;
+}
+
+// CMD_BRDSPI16_WR:
+void HandleBoardWrite(tLMS_Ctrl_Packet* in, tLMS_Ctrl_Packet* out)
+{
+	if(Check_block_count(in, out, 4))
+		return;
+	Reconfigure_SPI_for_LMS ();
+
+	uint8_t I2C_Addr = I2C_ADDR_SC18IS602B;
+
+	//write byte
+	CyU3PI2cPreamble_t preamble;
+	preamble.length    = 1;
+	preamble.buffer[0] = I2C_Addr;
+	preamble.ctrlMask  = 0x0000;
+	sc_brdg_data[0] = 0xF1; //Clear Interrupt
+
+	CyU3PI2cTransmitBytes (&preamble, &sc_brdg_data[0], 1, 0);
+
+	for(block = 0; block < in->Header.Data_blocks; block++)
+	{
+		//write reg addr
+		sbi(in->Data_field[0 + (block * 4)], 7); //set write bit
+	}
+
+	I2C_Addr = I2C_ADDR_SC18IS602B;
+
+	//write byte
+	preamble.length    = 2;
+	preamble.buffer[0] = I2C_Addr;
+	preamble.buffer[1] = BRDG_SPI_FPGA_SS; //FPGA SS
+	preamble.ctrlMask  = 0x0000;
+
+	if( CyU3PI2cTransmitBytes (&preamble, &in->Data_field[0], 4*in->Header.Data_blocks, 0) != CY_U3P_SUCCESS)
+		cmd_errors++;
+
+	Wait_till_SC18B20_busy ();
+
+	if(cmd_errors)
+		LMS_Ctrl_Packet_Tx->Header.Status = STATUS_ERROR_CMD;
+	else
+		LMS_Ctrl_Packet_Tx->Header.Status = STATUS_COMPLETED_CMD;
+}
+
+// CMD_BRDSPI16_RD:
+void HandleBoardRead(tLMS_Ctrl_Packet* in, tLMS_Ctrl_Packet* out)
+{
+	if(Check_block_count(in, out, 4))
+		return;
+
+	Reconfigure_SPI_for_LMS ();
+
+	uint8_t I2C_Addr = I2C_ADDR_SC18IS602B;
+
+	//write byte
+	CyU3PI2cPreamble_t preamble;
+	preamble.length    = 1;
+	preamble.buffer[0] = I2C_Addr;
+	preamble.ctrlMask  = 0x0000;
+
+	sc_brdg_data[0] = 0xF1; //Clear Interrupt
+
+	CyU3PI2cTransmitBytes (&preamble, &sc_brdg_data[0], 1, 0);
+
+	//write byte
+	preamble.length    = 2;
+	preamble.buffer[0] = I2C_Addr;
+	preamble.buffer[1] = BRDG_SPI_FPGA_SS; //FPGA SS
+	preamble.ctrlMask  = 0x0000;
+
+	for(block = 0; block < in->Header.Data_blocks; block++)
+	{
+		//write reg addr
+		cbi(in->Data_field[0 + (block * 2)], 7);  //clear write bit
+
+		sc_brdg_data[0 + (block * 4)] = in->Data_field[0 + (block * 2)]; //reg addr MSB
+		sc_brdg_data[1 + (block * 4)] = in->Data_field[1 + (block * 2)]; //reg addr LSB
+
+		sc_brdg_data[2 + (block * 4)] = 0x00; //dummy byte for spi reading
+		sc_brdg_data[3 + (block * 4)] = 0x00; //dummy byte for spi reading
+	}
+
+	if( CyU3PI2cTransmitBytes (&preamble, &sc_brdg_data[0], 4*in->Header.Data_blocks, 0) != CY_U3P_SUCCESS)  cmd_errors++;
+
+	Wait_till_SC18B20_busy ();
+
+	//read byte
+
+	I2C_Addr |= 1 << 0;	//read addr
+
+	preamble.length    = 1;
+	preamble.buffer[0] = I2C_Addr;
+	preamble.ctrlMask  = 0x0000;
+
+	if( CyU3PI2cReceiveBytes (&preamble, &sc_brdg_data[0], 4*in->Header.Data_blocks, 0)  != CY_U3P_SUCCESS)  cmd_errors++;
+
+	for(block = 0; block < in->Header.Data_blocks; block++)
+	{
+		out->Data_field[0 + (block * 4)] = in->Data_field[0 + (block * 2)]; //reg addr
+		out->Data_field[1 + (block * 4)] = in->Data_field[1 + (block * 2)]; //reg addr
+
+		//read reg data
+		out->Data_field[2 + (block * 4)] = sc_brdg_data[(block * 4) + 2]; //reg data MSB
+		out->Data_field[3 + (block * 4)] = sc_brdg_data[(block * 4) + 3]; //reg data LSB
+	}
+
+	if(cmd_errors)
+		out->Header.Status = STATUS_ERROR_CMD;
+	else
+		out->Header.Status = STATUS_COMPLETED_CMD;
+}
+
+void HandleLMS7002Write(const tLMS_Ctrl_Packet* in, tLMS_Ctrl_Packet* out)
+{
+	if(Check_block_count(in, out, 4))
+		return;
+	Reconfigure_SPI_for_LMS ();
+
+	const uint8_t I2C_Addr = I2C_ADDR_SC18IS602B;
+
+	Modify_BRDSPI16_Reg_bits (FPGA_SPI_REG_LMS1_LMS2_CTRL, LMS1_SS, LMS1_SS, 0); //Enable LMS's SPI
+
+	//write byte
+	CyU3PI2cPreamble_t preamble;
+	preamble.length    = 1;
+	preamble.buffer[0] = I2C_Addr;
+	preamble.buffer[1] = 0xF1; //Clear Interrupt
+	preamble.ctrlMask  = 0x0000;
+
+	sc_brdg_data[0] = 0xF1; //Clear Interrupt
+
+	CyU3PI2cTransmitBytes (&preamble, &sc_brdg_data[0], 1, 0);
+
+	for(block = 0; block < LMS_Ctrl_Packet_Rx->Header.Data_blocks; block++)
+	{
+		//write reg addr
+		sbi(LMS_Ctrl_Packet_Rx->Data_field[0 + (block * 4)], 7); //set write bit
+	}
+
+	//write byte
+	preamble.length    = 2;
+	preamble.buffer[0] = I2C_Addr;
+	preamble.buffer[1] = BRDG_SPI_DUMMY_SS;
+	preamble.ctrlMask  = 0x0000;
+
+	if( CyU3PI2cTransmitBytes (&preamble, &LMS_Ctrl_Packet_Rx->Data_field[0], 4*LMS_Ctrl_Packet_Rx->Header.Data_blocks, 0) != CY_U3P_SUCCESS)  cmd_errors++;
+
+	Wait_till_SC18B20_busy ();
+
+	Modify_BRDSPI16_Reg_bits (FPGA_SPI_REG_LMS1_LMS2_CTRL, LMS1_SS, LMS1_SS, 1); //Disable LMS's SPI
+
+	if(cmd_errors)
+		LMS_Ctrl_Packet_Tx->Header.Status = STATUS_ERROR_CMD;
+	else
+		LMS_Ctrl_Packet_Tx->Header.Status = STATUS_COMPLETED_CMD;
+}
+
+void HandleLMS7002WriteMasked(const tLMS_Ctrl_Packet* in, tLMS_Ctrl_Packet* out)
+{
+	const uint8_t blkSize = 6;
+	if(Check_block_count(in, out, blkSize))
+		return;
+	Reconfigure_SPI_for_LMS ();
+
+
+	// Read values
+	uint8_t I2C_Addr = I2C_ADDR_SC18IS602B;
+	Modify_BRDSPI16_Reg_bits (FPGA_SPI_REG_LMS1_LMS2_CTRL, LMS1_SS, LMS1_SS, 0); //Enable LMS's SPI
+
+	//write byte
+	CyU3PI2cPreamble_t preamble;
+	preamble.length    = 1;
+	preamble.buffer[0] = I2C_Addr;
+	preamble.ctrlMask  = 0x0000;
+	sc_brdg_data[0] = 0xF1; //Clear Interrupt
+	CyU3PI2cTransmitBytes (&preamble, &sc_brdg_data[0], 1, 0);
+
+	for(block = 0; block < LMS_Ctrl_Packet_Rx->Header.Data_blocks; block++)
+	{
+		//write reg addr
+		cbi(LMS_Ctrl_Packet_Rx->Data_field[0 + (block * blkSize)], 7);  //clear write bit
+
+		sc_brdg_data[0 + (block * 4)] = LMS_Ctrl_Packet_Rx->Data_field[0 + (block * blkSize)]; //reg addr MSB
+		sc_brdg_data[1 + (block * 4)] = LMS_Ctrl_Packet_Rx->Data_field[1 + (block * blkSize)]; //reg addr LSB
+
+		sc_brdg_data[2 + (block * 4)] = 0x00; //dummy byte for spi reading
+		sc_brdg_data[3 + (block * 4)] = 0x00; //dummy byte for spi reading
+	}
+
+	//write byte
+	preamble.length    = 2;
+	preamble.buffer[0] = I2C_Addr;
+	preamble.buffer[1] = BRDG_SPI_DUMMY_SS;
+	preamble.ctrlMask  = 0x0000;
+	if( CyU3PI2cTransmitBytes (&preamble, &sc_brdg_data[0], 4*LMS_Ctrl_Packet_Rx->Header.Data_blocks, 0) != CY_U3P_SUCCESS)
+		cmd_errors++;
+
+	Wait_till_SC18B20_busy ();
+
+	//read bytes from I2C buffer
+	I2C_Addr |= 1 << 0;	//read addr
+
+	preamble.length    = 1;
+	preamble.buffer[0] = I2C_Addr;
+	preamble.ctrlMask  = 0x0000;
+
+	if( CyU3PI2cReceiveBytes (&preamble, &sc_brdg_data[0], 4*LMS_Ctrl_Packet_Rx->Header.Data_blocks, 0)  != CY_U3P_SUCCESS)  cmd_errors++;
+
+	for(block = 0; block < LMS_Ctrl_Packet_Rx->Header.Data_blocks; block++)
+	{
+		LMS_Ctrl_Packet_Tx->Data_field[0 + (block * 4)] = LMS_Ctrl_Packet_Rx->Data_field[0 + (block * blkSize)]; //reg addr
+		LMS_Ctrl_Packet_Tx->Data_field[1 + (block * 4)] = LMS_Ctrl_Packet_Rx->Data_field[1 + (block * blkSize)]; //reg addr
+
+		//read reg data
+		uint8_t* mask = &LMS_Ctrl_Packet_Rx->Data_field[4 + (block * blkSize)];
+		LMS_Ctrl_Packet_Tx->Data_field[2 + (block * 4)] = sc_brdg_data[(block * 4) + 2] & (~mask[0]); //reg data MSB
+		LMS_Ctrl_Packet_Tx->Data_field[3 + (block * 4)] = sc_brdg_data[(block * 4) + 3] & (~mask[0]); //reg data LSB
+
+		uint8_t* value = &LMS_Ctrl_Packet_Rx->Data_field[2 + (block * blkSize)];
+		LMS_Ctrl_Packet_Tx->Data_field[2 + (block * 4)] |= (value[0] & mask[0]);
+		LMS_Ctrl_Packet_Tx->Data_field[3 + (block * 4)] |= (value[1] & mask[1]);
+	}
+
+	I2C_Addr = I2C_ADDR_SC18IS602B;
+ 	preamble.length    = 1;
+	preamble.buffer[0] = I2C_Addr;
+	preamble.buffer[1] = 0xF1; //Clear Interrupt
+	preamble.ctrlMask  = 0x0000;
+
+	sc_brdg_data[0] = 0xF1; //Clear Interrupt
+
+	CyU3PI2cTransmitBytes (&preamble, &sc_brdg_data[0], 1, 0);
+
+	for(block = 0; block < LMS_Ctrl_Packet_Rx->Header.Data_blocks; block++)
+	{
+		//write reg addr
+		sbi(LMS_Ctrl_Packet_Tx->Data_field[0 + (block * 4)], 7); //set write bit
+	}
+
+	//write byte
+	preamble.length    = 2;
+	preamble.buffer[0] = I2C_Addr;
+	preamble.buffer[1] = BRDG_SPI_DUMMY_SS;
+	preamble.ctrlMask  = 0x0000;
+
+	if( CyU3PI2cTransmitBytes (&preamble, &LMS_Ctrl_Packet_Tx->Data_field[0], 4*LMS_Ctrl_Packet_Rx->Header.Data_blocks, 0) != CY_U3P_SUCCESS)
+		cmd_errors++;
+
+	Wait_till_SC18B20_busy ();
+
+	Modify_BRDSPI16_Reg_bits (FPGA_SPI_REG_LMS1_LMS2_CTRL, LMS1_SS, LMS1_SS, 1); //Disable LMS's SPI
+
+	if(cmd_errors)
+		LMS_Ctrl_Packet_Tx->Header.Status = STATUS_ERROR_CMD;
+	else
+		LMS_Ctrl_Packet_Tx->Header.Status = STATUS_COMPLETED_CMD;
+}
+
+void HandleLMS7002Read(const tLMS_Ctrl_Packet* in, tLMS_Ctrl_Packet* out)
+{
+	if(Check_block_count(in, out, 4))
+		return;
+	Reconfigure_SPI_for_LMS ();
+
+	uint8_t I2C_Addr = I2C_ADDR_SC18IS602B;
+
+	Modify_BRDSPI16_Reg_bits (FPGA_SPI_REG_LMS1_LMS2_CTRL, LMS1_SS, LMS1_SS, 0); //Enable LMS's SPI
+
+	//write byte
+	CyU3PI2cPreamble_t preamble;
+	preamble.length    = 1;
+	preamble.buffer[0] = I2C_Addr;
+	preamble.ctrlMask  = 0x0000;
+	sc_brdg_data[0] = 0xF1; //Clear Interrupt
+	CyU3PI2cTransmitBytes (&preamble, &sc_brdg_data[0], 1, 0);
+
+	//write byte
+	preamble.length    = 2;
+	preamble.buffer[0] = I2C_Addr;
+	preamble.buffer[1] = BRDG_SPI_DUMMY_SS;
+	preamble.ctrlMask  = 0x0000;
+
+	for(block = 0; block < LMS_Ctrl_Packet_Rx->Header.Data_blocks; block++)
+	{
+		//write reg addr
+		cbi(LMS_Ctrl_Packet_Rx->Data_field[0 + (block * 2)], 7);  //clear write bit
+
+		sc_brdg_data[0 + (block * 4)] = LMS_Ctrl_Packet_Rx->Data_field[0 + (block * 2)]; //reg addr MSB
+		sc_brdg_data[1 + (block * 4)] = LMS_Ctrl_Packet_Rx->Data_field[1 + (block * 2)]; //reg addr LSB
+
+		sc_brdg_data[2 + (block * 4)] = 0x00; //dummy byte for spi reading
+		sc_brdg_data[3 + (block * 4)] = 0x00; //dummy byte for spi reading
+	}
+
+	if( CyU3PI2cTransmitBytes (&preamble, &sc_brdg_data[0], 4*LMS_Ctrl_Packet_Rx->Header.Data_blocks, 0) != CY_U3P_SUCCESS)
+		cmd_errors++;
+
+	Wait_till_SC18B20_busy ();
+
+	//read bytes from I2C buffer
+	I2C_Addr |= 1 << 0;	//read addr
+
+	preamble.length    = 1;
+	preamble.buffer[0] = I2C_Addr;
+	preamble.ctrlMask  = 0x0000;
+
+	if( CyU3PI2cReceiveBytes (&preamble, &sc_brdg_data[0], 4*LMS_Ctrl_Packet_Rx->Header.Data_blocks, 0)  != CY_U3P_SUCCESS)  cmd_errors++;
+
+	for(block = 0; block < LMS_Ctrl_Packet_Rx->Header.Data_blocks; block++)
+	{
+		LMS_Ctrl_Packet_Tx->Data_field[0 + (block * 4)] = LMS_Ctrl_Packet_Rx->Data_field[0 + (block * 2)]; //reg addr
+		LMS_Ctrl_Packet_Tx->Data_field[1 + (block * 4)] = LMS_Ctrl_Packet_Rx->Data_field[1 + (block * 2)]; //reg addr
+
+		//read reg data
+		LMS_Ctrl_Packet_Tx->Data_field[2 + (block * 4)] = sc_brdg_data[(block * 4) + 2]; //reg data MSB
+		LMS_Ctrl_Packet_Tx->Data_field[3 + (block * 4)] = sc_brdg_data[(block * 4) + 3]; //reg data LSB
+	}
+
+	CyU3PThreadSleep (1); //need some time?
+	//Wait_till_SC18B20_busy ();
+
+	Modify_BRDSPI16_Reg_bits (FPGA_SPI_REG_LMS1_LMS2_CTRL, LMS1_SS, LMS1_SS, 1); //Disable LMS's SPI
+
+	if(cmd_errors)
+		LMS_Ctrl_Packet_Tx->Header.Status = STATUS_ERROR_CMD;
+	else
+		LMS_Ctrl_Packet_Tx->Header.Status = STATUS_COMPLETED_CMD;
+}
 
 /* Application Error Handler */
 void CyFxAppErrorHandler (CyU3PReturnStatus_t apiRetStatus )   /* API return status */
@@ -418,14 +807,14 @@ CyBool_t CyFxSlFifoApplnUSBSetupCB (uint32_t setupdat0, uint32_t setupdat1)
 			case 0xC0: //read
 				CyU3PGpioSimpleSetValue (FX3_MCU_BUSY, CyTrue); //FX3 is busy
 				CyU3PGpioSimpleSetValue (FX3_MCU_BUSY, CyFalse); //FX3 is not busy
-				CyU3PUsbSendEP0Data (64, glEp0Buffer_Tx);
+				CyU3PUsbSendEP0Data (LMS_CTRL_PACKET_SIZE, glEp0Buffer_Tx);
 				if(need_fx3_reset) CyU3PDeviceReset(CyFalse); //hard fx3 reset
 				break;
 
 			case 0xC1: //write
 
 				CyU3PGpioSimpleSetValue (FX3_MCU_BUSY, CyTrue); //indicate busy
-				CyU3PUsbGetEP0Data (64, glEp0Buffer_Rx, NULL);
+				CyU3PUsbGetEP0Data (LMS_CTRL_PACKET_SIZE, glEp0Buffer_Rx, NULL);
 
 				// LMS64C protocol
 				memset (glEp0Buffer_Tx, 0, sizeof(glEp0Buffer_Tx)); //fill whole tx buffer with zeros
@@ -440,265 +829,27 @@ CyBool_t CyFxSlFifoApplnUSBSetupCB (uint32_t setupdat0, uint32_t setupdat1)
 				switch(LMS_Ctrl_Packet_Rx->Header.Command)
 				{
 					case CMD_GET_INFO:
-
-						//LSB_bytes
-						LMS_Ctrl_Packet_Tx->Data_field[0] = FW_VER;
-						LMS_Ctrl_Packet_Tx->Data_field[1] = DEV_TYPE;
-						LMS_Ctrl_Packet_Tx->Data_field[2] = LMS_PROTOCOL_VER;
-						LMS_Ctrl_Packet_Tx->Data_field[3] = HW_VER;
-						LMS_Ctrl_Packet_Tx->Data_field[4] = EXP_BOARD;
-
-						//BSN - board serial number
-						LMS_Ctrl_Packet_Tx->Data_field[10] = (die_id[1] >> 24) & 0xFF;
-						LMS_Ctrl_Packet_Tx->Data_field[11] = (die_id[1] >> 16) & 0xFF;
-						LMS_Ctrl_Packet_Tx->Data_field[12] = (die_id[1] >>  8) & 0xFF;
-						LMS_Ctrl_Packet_Tx->Data_field[13] = (die_id[1] >>  0) & 0xFF;
-
-						LMS_Ctrl_Packet_Tx->Data_field[14] = (die_id[0] >> 24) & 0xFF;
-						LMS_Ctrl_Packet_Tx->Data_field[15] = (die_id[0] >> 16) & 0xFF;
-						LMS_Ctrl_Packet_Tx->Data_field[16] = (die_id[0] >>  8) & 0xFF;
-						LMS_Ctrl_Packet_Tx->Data_field[17] = (die_id[0] >>  0) & 0xFF;
-
-						LMS_Ctrl_Packet_Tx->Header.Status = STATUS_COMPLETED_CMD;
+						FillDeviceInfo(LMS_Ctrl_Packet_Tx);
 						break;
-
 					case CMD_LMS_RST:
-
-						switch (LMS_Ctrl_Packet_Rx->Data_field[0])
-						{
-							case LMS_RST_DEACTIVATE:
-								Modify_BRDSPI16_Reg_bits (FPGA_SPI_REG_LMS1_LMS2_CTRL, LMS1_RESET, LMS1_RESET, 1); //high level
-								break;
-
-							case LMS_RST_ACTIVATE:
-								Modify_BRDSPI16_Reg_bits (FPGA_SPI_REG_LMS1_LMS2_CTRL, LMS1_RESET, LMS1_RESET, 0); //low level
-								break;
-
-							case LMS_RST_PULSE:
-								Modify_BRDSPI16_Reg_bits (FPGA_SPI_REG_LMS1_LMS2_CTRL, LMS1_RESET, LMS1_RESET, 0); //low level
-								Modify_BRDSPI16_Reg_bits (FPGA_SPI_REG_LMS1_LMS2_CTRL, LMS1_RESET, LMS1_RESET, 1); //high level
-								break;
-
-							default:
-								cmd_errors++;
-								break;
-						}
-
-						LMS_Ctrl_Packet_Tx->Header.Status = STATUS_COMPLETED_CMD;
+						HandleResetCommand(LMS_Ctrl_Packet_Rx, LMS_Ctrl_Packet_Tx);
 						break;
 
 					case CMD_LMS7002_WR:
-						if(Check_many_blocks (4)) break;
-						Reconfigure_SPI_for_LMS ();
-
-						I2C_Addr = I2C_ADDR_SC18IS602B;
-
-						Modify_BRDSPI16_Reg_bits (FPGA_SPI_REG_LMS1_LMS2_CTRL, LMS1_SS, LMS1_SS, 0); //Enable LMS's SPI
-
-						//write byte
-						preamble.length    = 1;
-						preamble.buffer[0] = I2C_Addr;
-						preamble.buffer[1] = 0xF1; //Clear Interrupt
-						preamble.ctrlMask  = 0x0000;
-
-						sc_brdg_data[0] = 0xF1; //Clear Interrupt
-
-						CyU3PI2cTransmitBytes (&preamble, &sc_brdg_data[0], 1, 0);
-
-						for(block = 0; block < LMS_Ctrl_Packet_Rx->Header.Data_blocks; block++)
-						{
-							//write reg addr
-							sbi(LMS_Ctrl_Packet_Rx->Data_field[0 + (block * 4)], 7); //set write bit
-						}
-
-						//write byte
-						preamble.length    = 2;
-						preamble.buffer[0] = I2C_Addr;
-						preamble.buffer[1] = BRDG_SPI_DUMMY_SS;
-						preamble.ctrlMask  = 0x0000;
-
-						if( CyU3PI2cTransmitBytes (&preamble, &LMS_Ctrl_Packet_Rx->Data_field[0], 4*LMS_Ctrl_Packet_Rx->Header.Data_blocks, 0) != CY_U3P_SUCCESS)  cmd_errors++;
-
-						Wait_till_SC18B20_busy ();
-
-						Modify_BRDSPI16_Reg_bits (FPGA_SPI_REG_LMS1_LMS2_CTRL, LMS1_SS, LMS1_SS, 1); //Disable LMS's SPI
-
-						if(cmd_errors) LMS_Ctrl_Packet_Tx->Header.Status = STATUS_ERROR_CMD;
-						else LMS_Ctrl_Packet_Tx->Header.Status = STATUS_COMPLETED_CMD;
+						HandleLMS7002Write(LMS_Ctrl_Packet_Rx, LMS_Ctrl_Packet_Tx);
 						break;
 
 					case CMD_LMS7002_RD:
-						if(Check_many_blocks (4)) break;
-						Reconfigure_SPI_for_LMS ();
-
-						I2C_Addr = I2C_ADDR_SC18IS602B;
-
-						Modify_BRDSPI16_Reg_bits (FPGA_SPI_REG_LMS1_LMS2_CTRL, LMS1_SS, LMS1_SS, 0); //Enable LMS's SPI
-
-						//write byte
-						preamble.length    = 1;
-						preamble.buffer[0] = I2C_Addr;
-						preamble.buffer[1] = 0xF1; //Clear Interrupt
-						preamble.ctrlMask  = 0x0000;
-						sc_brdg_data[0] = 0xF1; //Clear Interrupt
-						CyU3PI2cTransmitBytes (&preamble, &sc_brdg_data[0], 1, 0);
-
-						//write byte
-						preamble.length    = 2;
-						preamble.buffer[0] = I2C_Addr;
-						preamble.buffer[1] = BRDG_SPI_DUMMY_SS;
-						preamble.ctrlMask  = 0x0000;
-
-						for(block = 0; block < LMS_Ctrl_Packet_Rx->Header.Data_blocks; block++)
-						{
-							//write reg addr
-							cbi(LMS_Ctrl_Packet_Rx->Data_field[0 + (block * 2)], 7);  //clear write bit
-
-							sc_brdg_data[0 + (block * 4)] = LMS_Ctrl_Packet_Rx->Data_field[0 + (block * 2)]; //reg addr MSB
-							sc_brdg_data[1 + (block * 4)] = LMS_Ctrl_Packet_Rx->Data_field[1 + (block * 2)]; //reg addr LSB
-
-							sc_brdg_data[2 + (block * 4)] = 0x00; //dummy byte for spi reading
-							sc_brdg_data[3 + (block * 4)] = 0x00; //dummy byte for spi reading
-						}
-
-						if( CyU3PI2cTransmitBytes (&preamble, &sc_brdg_data[0], 4*LMS_Ctrl_Packet_Rx->Header.Data_blocks, 0) != CY_U3P_SUCCESS)  cmd_errors++;
-
-						Wait_till_SC18B20_busy ();
-
-						//read bytes from I2C buffer
-						I2C_Addr |= 1 << 0;	//read addr
-
-						preamble.length    = 1;
-						preamble.buffer[0] = I2C_Addr;
-						preamble.ctrlMask  = 0x0000;
-
-
-						if( CyU3PI2cReceiveBytes (&preamble, &sc_brdg_data[0], 4*LMS_Ctrl_Packet_Rx->Header.Data_blocks, 0)  != CY_U3P_SUCCESS)  cmd_errors++;
-
-						for(block = 0; block < LMS_Ctrl_Packet_Rx->Header.Data_blocks; block++)
-						{
-							LMS_Ctrl_Packet_Tx->Data_field[0 + (block * 4)] = LMS_Ctrl_Packet_Rx->Data_field[0 + (block * 2)]; //reg addr
-							LMS_Ctrl_Packet_Tx->Data_field[1 + (block * 4)] = LMS_Ctrl_Packet_Rx->Data_field[1 + (block * 2)]; //reg addr
-
-							//read reg data
-							LMS_Ctrl_Packet_Tx->Data_field[2 + (block * 4)] = sc_brdg_data[(block * 4) + 2]; //reg data MSB
-							LMS_Ctrl_Packet_Tx->Data_field[3 + (block * 4)] = sc_brdg_data[(block * 4) + 3]; //reg data LSB
-						}
-
-						CyU3PThreadSleep (1); //need some time?
-						//Wait_till_SC18B20_busy ();
-
-						Modify_BRDSPI16_Reg_bits (FPGA_SPI_REG_LMS1_LMS2_CTRL, LMS1_SS, LMS1_SS, 1); //Disable LMS's SPI
-
-						if(cmd_errors) LMS_Ctrl_Packet_Tx->Header.Status = STATUS_ERROR_CMD;
-						else LMS_Ctrl_Packet_Tx->Header.Status = STATUS_COMPLETED_CMD;
+						HandleLMS7002Read(LMS_Ctrl_Packet_Rx, LMS_Ctrl_Packet_Tx);
 						break;
-
+					case CMD_LMS7002_WR_MASKED:
+						HandleLMS7002WriteMasked(LMS_Ctrl_Packet_Rx, LMS_Ctrl_Packet_Tx);
+						break;
 					case CMD_BRDSPI16_WR:
-						if(Check_many_blocks (4)) break;
-
-						Reconfigure_SPI_for_LMS ();
-
-						I2C_Addr = I2C_ADDR_SC18IS602B;
-
-						//write byte
-						preamble.length    = 1;
-						preamble.buffer[0] = I2C_Addr;
-						preamble.buffer[1] = 0xF1; //Clear Interrupt
-						preamble.ctrlMask  = 0x0000;
-
-						sc_brdg_data[0] = 0xF1; //Clear Interrupt
-
-						CyU3PI2cTransmitBytes (&preamble, &sc_brdg_data[0], 1, 0);
-
-						for(block = 0; block < LMS_Ctrl_Packet_Rx->Header.Data_blocks; block++)
-						{
-							//write reg addr
-							sbi(LMS_Ctrl_Packet_Rx->Data_field[0 + (block * 4)], 7); //set write bit
-						}
-
-						I2C_Addr = I2C_ADDR_SC18IS602B;
-
-						//write byte
-						preamble.length    = 2;
-						preamble.buffer[0] = I2C_Addr;
-						preamble.buffer[1] = BRDG_SPI_FPGA_SS; //FPGA SS
-						preamble.ctrlMask  = 0x0000;
-
-						if( CyU3PI2cTransmitBytes (&preamble, &LMS_Ctrl_Packet_Rx->Data_field[0], 4*LMS_Ctrl_Packet_Rx->Header.Data_blocks, 0) != CY_U3P_SUCCESS)  cmd_errors++;
-
-						Wait_till_SC18B20_busy ();
-
-						if(cmd_errors) LMS_Ctrl_Packet_Tx->Header.Status = STATUS_ERROR_CMD;
-						else LMS_Ctrl_Packet_Tx->Header.Status = STATUS_COMPLETED_CMD;
-
+						HandleBoardWrite(LMS_Ctrl_Packet_Rx, LMS_Ctrl_Packet_Tx);
 						break;
-
 					case CMD_BRDSPI16_RD:
-
-						if(Check_many_blocks (4)) break;
-
-						Reconfigure_SPI_for_LMS ();
-
-						I2C_Addr = I2C_ADDR_SC18IS602B;
-
-						//write byte
-						preamble.length    = 1;
-						preamble.buffer[0] = I2C_Addr;
-						preamble.buffer[1] = 0xF1; //Clear Interrupt
-						preamble.ctrlMask  = 0x0000;
-
-						sc_brdg_data[0] = 0xF1; //Clear Interrupt
-
-						CyU3PI2cTransmitBytes (&preamble, &sc_brdg_data[0], 1, 0);
-
-
-						I2C_Addr = I2C_ADDR_SC18IS602B;
-
-						//write byte
-						preamble.length    = 2;
-						preamble.buffer[0] = I2C_Addr;
-						preamble.buffer[1] = BRDG_SPI_FPGA_SS; //FPGA SS
-						preamble.ctrlMask  = 0x0000;
-
-						for(block = 0; block < LMS_Ctrl_Packet_Rx->Header.Data_blocks; block++)
-						{
-							//write reg addr
-							cbi(LMS_Ctrl_Packet_Rx->Data_field[0 + (block * 2)], 7);  //clear write bit
-
-							sc_brdg_data[0 + (block * 4)] = LMS_Ctrl_Packet_Rx->Data_field[0 + (block * 2)]; //reg addr MSB
-							sc_brdg_data[1 + (block * 4)] = LMS_Ctrl_Packet_Rx->Data_field[1 + (block * 2)]; //reg addr LSB
-
-							sc_brdg_data[2 + (block * 4)] = 0x00; //dummy byte for spi reading
-							sc_brdg_data[3 + (block * 4)] = 0x00; //dummy byte for spi reading
-						}
-
-						if( CyU3PI2cTransmitBytes (&preamble, &sc_brdg_data[0], 4*LMS_Ctrl_Packet_Rx->Header.Data_blocks, 0) != CY_U3P_SUCCESS)  cmd_errors++;
-
-						Wait_till_SC18B20_busy ();
-
-						//read byte
-
-						I2C_Addr |= 1 << 0;	//read addr
-
-						preamble.length    = 1;
-						preamble.buffer[0] = I2C_Addr;
-						preamble.ctrlMask  = 0x0000;
-
-						if( CyU3PI2cReceiveBytes (&preamble, &sc_brdg_data[0], 4*LMS_Ctrl_Packet_Rx->Header.Data_blocks, 0)  != CY_U3P_SUCCESS)  cmd_errors++;
-
-						for(block = 0; block < LMS_Ctrl_Packet_Rx->Header.Data_blocks; block++)
-						{
-							LMS_Ctrl_Packet_Tx->Data_field[0 + (block * 4)] = LMS_Ctrl_Packet_Rx->Data_field[0 + (block * 2)]; //reg addr
-							LMS_Ctrl_Packet_Tx->Data_field[1 + (block * 4)] = LMS_Ctrl_Packet_Rx->Data_field[1 + (block * 2)]; //reg addr
-
-							//read reg data
-							LMS_Ctrl_Packet_Tx->Data_field[2 + (block * 4)] = sc_brdg_data[(block * 4) + 2]; //reg data MSB
-							LMS_Ctrl_Packet_Tx->Data_field[3 + (block * 4)] = sc_brdg_data[(block * 4) + 3]; //reg data LSB
-						}
-
-						if(cmd_errors) LMS_Ctrl_Packet_Tx->Header.Status = STATUS_ERROR_CMD;
-						else LMS_Ctrl_Packet_Tx->Header.Status = STATUS_COMPLETED_CMD;
+						HandleBoardRead(LMS_Ctrl_Packet_Rx, LMS_Ctrl_Packet_Tx);
 						break;
 
 					case CMD_ADF4002_WR:
@@ -1209,350 +1360,6 @@ CyBool_t CyFxSlFifoApplnUSBSetupCB (uint32_t setupdat0, uint32_t setupdat1)
 						if(cmd_errors) LMS_Ctrl_Packet_Tx->Header.Status = STATUS_ERROR_CMD;
 						else LMS_Ctrl_Packet_Tx->Header.Status = STATUS_COMPLETED_CMD;
 						break;
-
-					case CMD_LMS_MCU_FW_WR:
-
-						current_portion = LMS_Ctrl_Packet_Rx->Data_field[1];
-
-						//check if portions are send in correct order
-						if(current_portion != 0) //not first portion?
-						{
-							if(last_portion != (current_portion - 1)) //portion number increments?
-							{
-								LMS_Ctrl_Packet_Tx->Header.Status = STATUS_WRONG_ORDER_CMD;
-								break;
-							}
-						}
-
-						I2C_Addr = I2C_ADDR_SC18IS602B;
-
-						Modify_BRDSPI16_Reg_bits (FPGA_SPI_REG_LMS1_LMS2_CTRL, LMS1_SS, LMS1_SS, 0); //Enable LMS's SPI
-
-						if (current_portion == 0) //PORTION_NR = first fifo
-						{
-
-							//write byte
-							preamble.length    = 1;
-							preamble.buffer[0] = I2C_Addr;
-							preamble.buffer[1] = 0xF1; //Clear Interrupt
-							preamble.ctrlMask  = 0x0000;
-							sc_brdg_data[0] = 0xF1; //Clear Interrupt
-							CyU3PI2cTransmitBytes (&preamble, &sc_brdg_data[0], 1, 0);
-
-							//write byte
-							preamble.length    = 2;
-							preamble.buffer[0] = I2C_Addr;
-							preamble.buffer[1] = BRDG_SPI_DUMMY_SS;
-							preamble.ctrlMask  = 0x0000;
-
-							//reset mcu
-							sc_brdg_data[0] = (0x80); //reg addr MSB with write bit
-							sc_brdg_data[1] = (MCU_CONTROL_REG); //reg addr LSB
-
-							sc_brdg_data[2] = (0x00); //reg data MSB
-							sc_brdg_data[3] = (0x00); //reg data LSB //8
-
-							if( CyU3PI2cTransmitBytes (&preamble, &sc_brdg_data[0], 4, 0) != CY_U3P_SUCCESS)  cmd_errors++;
-
-							Wait_till_SC18B20_busy ();
-
-							//write byte
-							preamble.length    = 1;
-							preamble.buffer[0] = I2C_Addr;
-							preamble.buffer[1] = 0xF1; //Clear Interrupt
-							preamble.ctrlMask  = 0x0000;
-							sc_brdg_data[0] = 0xF1; //Clear Interrupt
-							CyU3PI2cTransmitBytes (&preamble, &sc_brdg_data[0], 1, 0);
-
-							//write byte
-							preamble.length    = 2;
-							preamble.buffer[0] = I2C_Addr;
-							preamble.buffer[1] = BRDG_SPI_DUMMY_SS;
-							preamble.ctrlMask  = 0x0000;
-
-							//set mode
-							//write reg addr - mSPI_REG2 (Controls MCU input pins)
-							sc_brdg_data[0] = (0x80); //reg addr MSB with write bit
-							sc_brdg_data[1] = (MCU_CONTROL_REG); //reg addr LSB
-
-							sc_brdg_data[2] = (0x00); //reg data MSB
-
-							//reg data LSB
-							switch (LMS_Ctrl_Packet_Rx->Data_field[0]) //PROG_MODE
-							{
-								case PROG_EEPROM:
-									sc_brdg_data[3] = (0x01); //Programming both EEPROM and SRAM  //8
-									if( CyU3PI2cTransmitBytes (&preamble, &sc_brdg_data[0], 4, 0) != CY_U3P_SUCCESS)  cmd_errors++;
-									Wait_till_SC18B20_busy ();
-									break;
-
-								case PROG_SRAM:
-									sc_brdg_data[3] =(0x02); //Programming only SRAM  //8
-									if( CyU3PI2cTransmitBytes (&preamble, &sc_brdg_data[0], 4, 0) != CY_U3P_SUCCESS)  cmd_errors++;
-									Wait_till_SC18B20_busy ();
-									break;
-
-								case BOOT_MCU:
-									sc_brdg_data[3] = (0x03); //Programming both EEPROM and SRAM  //8
-									if( CyU3PI2cTransmitBytes (&preamble, &sc_brdg_data[0], 4, 0) != CY_U3P_SUCCESS)  cmd_errors++;
-									Wait_till_SC18B20_busy ();
-
-									//write byte
-									preamble.length    = 1;
-									preamble.buffer[0] = I2C_Addr;
-									preamble.buffer[1] = 0xF1; //Clear Interrupt
-									preamble.ctrlMask  = 0x0000;
-									sc_brdg_data[0] = 0xF1; //Clear Interrupt
-									CyU3PI2cTransmitBytes (&preamble, &sc_brdg_data[0], 1, 0);
-
-
-									//write byte
-									preamble.length    = 2;
-									preamble.buffer[0] = I2C_Addr;
-									preamble.buffer[1] = BRDG_SPI_DUMMY_SS;
-									preamble.ctrlMask  = 0x0000;
-
-									sc_brdg_data[0] = (0x00); //reg addr MSB
-									sc_brdg_data[1] = (MCU_STATUS_REG); //reg addr LSB
-									sc_brdg_data[2] = 0x00;  //dummy byte for spi reading
-									sc_brdg_data[3] = 0x00;  //dummy byte for spi reading
-
-									if( CyU3PI2cTransmitBytes (&preamble, &sc_brdg_data[0], 4, 0) != CY_U3P_SUCCESS)  cmd_errors++;
-
-									Wait_till_SC18B20_busy ();
-
-
-									//read bytes from I2C buffer
-									I2C_Addr |= 1 << 0;	//read addr
-
-									preamble.length    = 1;
-									preamble.buffer[0] = I2C_Addr;
-									preamble.ctrlMask  = 0x0000;
-
-									if( CyU3PI2cReceiveBytes (&preamble, &sc_brdg_data[0], 4, 0)  != CY_U3P_SUCCESS)  cmd_errors++;
-									temp_status = sc_brdg_data[3]; //reg data LSB
-									CyU3PThreadSleep (1); ///????
-
-									goto BOOTING;
-
-									break;
-							}
-						}
-
-						MCU_retries = 0;
-
-						//wait till EMPTY_WRITE_BUFF = 1
-						while (MCU_retries < MAX_MCU_RETRIES)
-						{
-							//read status reg
-
-							//spi read
-							//write reg addr
-
-							I2C_Addr = I2C_ADDR_SC18IS602B;
-
-							//write byte
-							preamble.length    = 1;
-							preamble.buffer[0] = I2C_Addr;
-							preamble.buffer[1] = 0xF1; //Clear Interrupt
-							preamble.ctrlMask  = 0x0000;
-							sc_brdg_data[0] = 0xF1; //Clear Interrupt
-							CyU3PI2cTransmitBytes (&preamble, &sc_brdg_data[0], 1, 0);
-
-							//write byte
-							preamble.length    = 2;
-							preamble.buffer[0] = I2C_Addr;
-							preamble.buffer[1] = BRDG_SPI_DUMMY_SS;
-							preamble.ctrlMask  = 0x0000;
-
-							sc_brdg_data[0] = (0x00); //reg addr MSB
-							sc_brdg_data[1] = (MCU_STATUS_REG); //reg addr LSB
-							sc_brdg_data[2] = 0x00;  //dummy byte for spi reading
-							sc_brdg_data[3] = 0x00;  //dummy byte for spi reading
-
-							if( CyU3PI2cTransmitBytes (&preamble, &sc_brdg_data[0], 4, 0) != CY_U3P_SUCCESS)  cmd_errors++;
-
-							Wait_till_SC18B20_busy ();
-
-							//read bytes from I2C buffer
-							I2C_Addr |= 1 << 0;	//read addr
-
-							preamble.length    = 1;
-							preamble.buffer[0] = I2C_Addr;
-							preamble.ctrlMask  = 0x0000;
-
-							if( CyU3PI2cReceiveBytes (&preamble, &sc_brdg_data[0], 4, 0)  != CY_U3P_SUCCESS)  cmd_errors++;
-							temp_status = sc_brdg_data[3]; //reg data LSB
-							CyU3PThreadSleep (1); ///wait
-
-
-							if (temp_status &0x01) break; //EMPTY_WRITE_BUFF = 1
-
-							MCU_retries++;
-							Delay_us (30);
-						}
-
-						//write 32 bytes to FIFO
-						for(block = 0; block < 32; block++)
-						{
-							I2C_Addr = I2C_ADDR_SC18IS602B;
-
-							//write byte
-							preamble.length    = 1;
-							preamble.buffer[0] = I2C_Addr;
-							preamble.buffer[1] = 0xF1; //Clear Interrupt
-							preamble.ctrlMask  = 0x0000;
-							sc_brdg_data[0] = 0xF1; //Clear Interrupt
-							CyU3PI2cTransmitBytes (&preamble, &sc_brdg_data[0], 1, 0);
-
-							//write byte
-							preamble.length    = 2;
-							preamble.buffer[0] = I2C_Addr;
-							preamble.buffer[1] = BRDG_SPI_DUMMY_SS;
-							preamble.ctrlMask  = 0x0000;
-
-							//reset mcu
-							sc_brdg_data[0] = (0x80); //reg addr MSB with write bit
-							sc_brdg_data[1] = (MCU_FIFO_WR_REG); //reg addr LSB
-
-							sc_brdg_data[2] = (0x00); //reg data MSB
-							sc_brdg_data[3] = (LMS_Ctrl_Packet_Rx->Data_field[2 + block]); //reg data LSB //8
-
-							if( CyU3PI2cTransmitBytes (&preamble, &sc_brdg_data[0], 4, 0) != CY_U3P_SUCCESS)  cmd_errors++;
-
-							Wait_till_SC18B20_busy ();
-
-							temp_status=0;
-							MCU_retries = 0;
-						}
-
-						MCU_retries = 0;
-
-						//wait till EMPTY_WRITE_BUFF = 1
-						while (MCU_retries < 500)
-						{
-							//read status reg
-
-							//spi read
-							//write reg addr
-
-							I2C_Addr = I2C_ADDR_SC18IS602B;
-
-							//write byte
-							preamble.length    = 1;
-							preamble.buffer[0] = I2C_Addr;
-							preamble.buffer[1] = 0xF1; //Clear Interrupt
-							preamble.ctrlMask  = 0x0000;
-							sc_brdg_data[0] = 0xF1; //Clear Interrupt
-							CyU3PI2cTransmitBytes (&preamble, &sc_brdg_data[0], 1, 0);
-
-
-							//write byte
-							preamble.length    = 2;
-							preamble.buffer[0] = I2C_Addr;
-							preamble.buffer[1] = BRDG_SPI_DUMMY_SS;
-							preamble.ctrlMask  = 0x0000;
-
-							sc_brdg_data[0] = (0x00); //reg addr MSB
-							sc_brdg_data[1] = (MCU_STATUS_REG); //reg addr LSB
-							sc_brdg_data[2] = 0x00;  //dummy byte for spi reading
-							sc_brdg_data[3] = 0x00;  //dummy byte for spi reading
-
-							if( CyU3PI2cTransmitBytes (&preamble, &sc_brdg_data[0], 4, 0) != CY_U3P_SUCCESS)  cmd_errors++;
-
-							Wait_till_SC18B20_busy ();
-
-
-							//read bytes from I2C buffer
-							I2C_Addr |= 1 << 0;	//read addr
-
-							preamble.length    = 1;
-							preamble.buffer[0] = I2C_Addr;
-							preamble.ctrlMask  = 0x0000;
-
-							if( CyU3PI2cReceiveBytes (&preamble, &sc_brdg_data[0], 4, 0)  != CY_U3P_SUCCESS)  cmd_errors++;
-							temp_status = sc_brdg_data[3]; //reg data LSB
-							CyU3PThreadSleep (1); //wait
-
-							if (temp_status &0x01) break;  //EMPTY_WRITE_BUFF = 1
-
-							MCU_retries++;
-							Delay_us (30);
-						}
-
-
-						if (current_portion  == 255) //PORTION_NR = last FIFO
-						{
-							//check programmed bit
-
-							MCU_retries = 0;
-
-							//wait till PROGRAMMED = 1
-							while (MCU_retries < MAX_MCU_RETRIES)
-							{
-								//read status reg
-
-								//spi read
-								//write reg addr
-
-								I2C_Addr = I2C_ADDR_SC18IS602B;
-
-								//write byte
-								preamble.length    = 1;
-								preamble.buffer[0] = I2C_Addr;
-								preamble.buffer[1] = 0xF1; //Clear Interrupt
-								preamble.ctrlMask  = 0x0000;
-								sc_brdg_data[0] = 0xF1; //Clear Interrupt
-								CyU3PI2cTransmitBytes (&preamble, &sc_brdg_data[0], 1, 0);
-
-
-								//write byte
-								preamble.length    = 2;
-								preamble.buffer[0] = I2C_Addr;
-								preamble.buffer[1] = BRDG_SPI_DUMMY_SS;
-								preamble.ctrlMask  = 0x0000;
-
-								sc_brdg_data[0] = (0x00); //reg addr MSB
-								sc_brdg_data[1] = (MCU_STATUS_REG); //reg addr LSB
-								sc_brdg_data[2] = 0x00;  //dummy byte for spi reading
-								sc_brdg_data[3] = 0x00;  //dummy byte for spi reading
-
-								if( CyU3PI2cTransmitBytes (&preamble, &sc_brdg_data[0], 4, 0) != CY_U3P_SUCCESS)  cmd_errors++;
-
-								Wait_till_SC18B20_busy ();
-
-
-								//read bytes from I2C buffer
-								I2C_Addr |= 1 << 0;	//read addr
-
-								preamble.length    = 1;
-								preamble.buffer[0] = I2C_Addr;
-								preamble.ctrlMask  = 0x0000;
-
-								if( CyU3PI2cReceiveBytes (&preamble, &sc_brdg_data[0], 4, 0)  != CY_U3P_SUCCESS)  cmd_errors++;
-								temp_status = sc_brdg_data[3]; //reg data LSB
-								CyU3PThreadSleep (1); //wait
-
-								if (temp_status &0x40) break; //PROGRAMMED = 1
-
-								MCU_retries++;
-								Delay_us (30);
-							}
-
-							if (MCU_retries == MAX_MCU_RETRIES) cmd_errors++;
-						}
-
-						last_portion = current_portion; //save last portion number
-
-BOOTING:
-
-						if(cmd_errors) LMS_Ctrl_Packet_Tx->Header.Status = STATUS_ERROR_CMD;
-						else LMS_Ctrl_Packet_Tx->Header.Status = STATUS_COMPLETED_CMD;
-
-						Modify_BRDSPI16_Reg_bits (FPGA_SPI_REG_LMS1_LMS2_CTRL, LMS1_SS, LMS1_SS, 1); //Disable LMS's SPI
-
-						break;
-
 
 					default:
 

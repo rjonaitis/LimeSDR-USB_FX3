@@ -66,6 +66,7 @@ enum eEXP_BOARD {
 #define CMD_LMS7002_RD		0x22 //Reads data from LMS7002 chip via SPI (16 bits word)
 #define CMD_LMS6002_WR		0x23 //Writes data to LMS6002 chip via SPI (8 bits word)
 #define CMD_LMS6002_RD		0x24 //Reads data from LMS6002 chip via SPI (8 bits word)
+#define CMD_LMS7002_WR_MASKED 0x25
 
 #define CMD_LMS_LNA			0x2A
 #define CMD_LMS_PA			0x2B
